@@ -61,6 +61,10 @@ app.get('/api/health', (req, res) => {
   res.status(200).json({ status: 'ok', service: 'NosePies E2EE Backend', uptime: process.uptime(), timestamp: Date.now() });
 });
 
+app.get('/healthz', (req, res) => {
+  res.status(200).send('OK');
+});
+
 app.get('/', (req, res) => {
   res.status(200).send('🔒 NosePies E2EE Encrypted Messaging Relay is running.');
 });
