@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: nosepies-backend
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node index.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_PATH
+        value: /var/data/chat.db
+    disk:
+      name: nosepies-data
+      mountPath: /var/data
+      sizeGB: 1
