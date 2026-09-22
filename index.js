@@ -472,7 +472,8 @@ io.on('connection', (socket) => {
       }
 
       socket.username = username;
-      onlineUsers.set(username, socket.id);
+      const lowerUsername = username.toLowerCase();
+      onlineUsers.set(lowerUsername, socket.id);
       console.log(`User ${username} authenticated on socket ${socket.id}`);
 
       // Determine visibility: explicit client param or saved preference in DB (default 1 / true)
@@ -538,7 +539,7 @@ io.on('connection', (socket) => {
     try {
       // 1. Deliver offline messages
       const messages = await db.all(
-        'SELECT id, sender, recipient, encrypted_payload, message_id, timestamp, created_at FROM queued_messages WHERE recipient = ? ORDER BY id ASC',
+        'SELECT id, sender, recipient, encrypted_payload, message_id, timestamp, created_at FROM queued_messages WHERE LOWER(recipient) = LOWER(?) ORDER BY id ASC',
         [socket.username]
       );
 
@@ -552,7 +553,7 @@ io.on('connection', (socket) => {
 
       // 2. Deliver offline read and delivered receipts to this user
       const receipts = await db.all(
-        'SELECT id, sender, message_id, status FROM queued_receipts WHERE recipient = ? ORDER BY id ASC',
+        'SELECT id, sender, message_id, status FROM queued_receipts WHERE LOWER(recipient) = LOWER(?) ORDER BY id ASC',
         [socket.username]
       );
       if (receipts && receipts.length > 0) {
@@ -568,7 +569,7 @@ io.on('connection', (socket) => {
         console.log(`Delivered and cleared ${receipts.length} queued receipts for ${socket.username}`);
       }
     } catch (err) {
-      console.error('Fetch queued messages error:', err);
+      console.error('Error delivering queued items:', err);
     }
   });
 
@@ -595,7 +596,7 @@ io.on('connection', (socket) => {
       const finalMsgId = messageId || (Date.now().toString() + '_' + Math.random().toString(36).substr(2, 6));
       const nowIso = new Date().toISOString();
       const isRecipientBot = bot.isBot(recipient);
-      const isRecipientOnline = onlineUsers.has(recipient);
+      const isRecipientOnline = onlineUsers.has(recipient.toLowerCase()) || onlineUsers.has(recipient);
       const initialStatus = isRecipientBot ? 'read' : (isRecipientOnline ? 'delivered' : 'sent');
 
       // Always persist opaque ciphertext with initial delivery/read status in vault
@@ -617,7 +618,7 @@ io.on('connection', (socket) => {
         return;
       }
 
-      const recipientSocketId = onlineUsers.get(recipient);
+      const recipientSocketId = onlineUsers.get(recipient.toLowerCase()) || onlineUsers.get(recipient);
       
       if (recipientSocketId) {
         // Recipient is online, relay instantly
@@ -778,7 +779,9 @@ io.on('connection', (socket) => {
     if (socket.username) {
       const username = socket.username;
       onlineUsers.delete(username);
+      onlineUsers.delete(username.toLowerCase());
       hiddenOnlineUsers.delete(username);
+      hiddenOnlineUsers.delete(username.toLowerCase());
       console.log(`User ${username} disconnected`);
       // Broadcast offline status change
       io.emit('status_change', { username, status: 'offline' });
