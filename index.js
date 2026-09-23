@@ -24,7 +24,8 @@ const hiddenOnlineUsers = new Set(); // usernames who opted to hide their online
 
 // Helper: Dispatch high-priority push notification via Expo Push Notification Service
 async function sendExpoPushNotification(pushToken, title, body, data = {}) {
-  if (!pushToken || typeof pushToken !== 'string' || !pushToken.startsWith('ExponentPushToken[')) {
+  if (!pushToken || typeof pushToken !== 'string' || (!pushToken.includes('PushToken['))) {
+    console.warn(`[Push] Invalid or missing push token format: ${pushToken}`);
     return;
   }
   try {
@@ -35,6 +36,7 @@ async function sendExpoPushNotification(pushToken, title, body, data = {}) {
       body,
       channelId: 'messages',
       priority: 'high',
+      _displayInForeground: true,
       badge: 1,
       data
     };
