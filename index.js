@@ -2,6 +2,7 @@ const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
 const cors = require('cors');
+const crypto = require('crypto');
 const db = require('./db');
 const bot = require('./bot');
 
@@ -89,7 +90,7 @@ app.post('/api/push-token', async (req, res) => {
 
 // Register user with device hardware limit & high-entropy connection code
 app.post('/api/register', async (req, res) => {
-  const { username, authKeyHash, identityPubKey, encryptedPrivKey, prekeys, deviceId } = req.body;
+  const { username, authKeyHash, identityPubKey, encryptedPrivKey, prekeys, deviceId, recoveryEncryptedPrivKey } = req.body;
 
   if (!username || !authKeyHash || !identityPubKey || !encryptedPrivKey) {
     return res.status(400).json({ error: 'Missing required registration fields' });
@@ -132,10 +133,10 @@ app.post('/api/register', async (req, res) => {
       codeExists = await db.get('SELECT username FROM users WHERE connection_code = ?', [connectionCode]);
     }
 
-    // 4. Insert user with device_id and connection_code
+    // 4. Insert user with device_id, connection_code and recoveryEncryptedPrivKey
     await db.run(
-      'INSERT INTO users (username, auth_key_hash, identity_pub_key, encrypted_priv_key, connection_code, device_id) VALUES (?, ?, ?, ?, ?, ?)',
-      [cleanUsername, authKeyHash, identityPubKey, encryptedPrivKey, connectionCode, deviceId || null]
+      'INSERT INTO users (username, auth_key_hash, identity_pub_key, encrypted_priv_key, connection_code, device_id, recovery_encrypted_priv_key) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [cleanUsername, authKeyHash, identityPubKey, encryptedPrivKey, connectionCode, deviceId || null, recoveryEncryptedPrivKey || null]
     );
 
     // 5. Record creation event in device_creations for rolling 30-day quota (Option B)
@@ -454,6 +455,352 @@ app.post('/api/messages/sync', async (req, res) => {
   } catch (err) {
     console.error('Vault sync error:', err);
     res.status(500).json({ error: 'Database error fetching message vault' });
+  }
+});
+
+// --- Recovery Routes (Emergency Phrase & Trusted Social Recovery) ---
+
+// Setup or update emergency recovery phrase blob
+app.post('/api/recovery/phrase/setup', async (req, res) => {
+  const { username, authKeyHash, recoveryEncryptedPrivKey } = req.body;
+  if (!username || !authKeyHash || !recoveryEncryptedPrivKey) {
+    return res.status(400).json({ error: 'Missing recovery setup parameters' });
+  }
+
+  const cleanUsername = username.trim().toLowerCase();
+  try {
+    const user = await db.get('SELECT auth_key_hash FROM users WHERE LOWER(username) = ?', [cleanUsername]);
+    if (!user || user.auth_key_hash !== authKeyHash) {
+      return res.status(401).json({ error: 'Authentication failed' });
+    }
+
+    await db.run('UPDATE users SET recovery_encrypted_priv_key = ? WHERE LOWER(username) = ?', [recoveryEncryptedPrivKey, cleanUsername]);
+    res.json({ success: true, message: 'Emergency recovery phrase registered successfully' });
+  } catch (err) {
+    console.error('Recovery phrase setup error:', err);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// Challenge / fetch recovery phrase blob for account recovery
+app.get('/api/recovery/phrase/challenge/:username', async (req, res) => {
+  const cleanUsername = (req.params.username || '').trim().toLowerCase();
+  if (!cleanUsername) return res.status(400).json({ error: 'Username required' });
+
+  try {
+    const user = await db.get(
+      'SELECT identity_pub_key, encrypted_priv_key, recovery_encrypted_priv_key, connection_code FROM users WHERE LOWER(username) = ?',
+      [cleanUsername]
+    );
+
+    if (!user) {
+      return res.status(404).json({ error: 'Account not found' });
+    }
+
+    if (!user.recovery_encrypted_priv_key) {
+      return res.status(404).json({ error: 'No emergency recovery phrase on file for this account' });
+    }
+
+    res.json({
+      identityPubKey: user.identity_pub_key,
+      recoveryEncryptedPrivKey: user.recovery_encrypted_priv_key,
+      connectionCode: user.connection_code
+    });
+  } catch (err) {
+    console.error('Recovery challenge error:', err);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// Complete recovery via emergency recovery phrase
+app.post('/api/recovery/phrase/complete', async (req, res) => {
+  const { username, newAuthKeyHash, newEncryptedPrivKey, newRecoveryEncryptedPrivKey } = req.body;
+  if (!username || !newAuthKeyHash || !newEncryptedPrivKey) {
+    return res.status(400).json({ error: 'Missing required recovery completion fields' });
+  }
+
+  const cleanUsername = username.trim().toLowerCase();
+  try {
+    const user = await db.get('SELECT username FROM users WHERE LOWER(username) = ?', [cleanUsername]);
+    if (!user) {
+      return res.status(404).json({ error: 'Account not found' });
+    }
+
+    await db.run(
+      'UPDATE users SET auth_key_hash = ?, encrypted_priv_key = ?, recovery_encrypted_priv_key = COALESCE(?, recovery_encrypted_priv_key) WHERE LOWER(username) = ?',
+      [newAuthKeyHash, newEncryptedPrivKey, newRecoveryEncryptedPrivKey || null, cleanUsername]
+    );
+
+    res.json({ success: true, message: 'Account credentials successfully restored' });
+  } catch (err) {
+    console.error('Recovery completion error:', err);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// Setup or update Trusted Contact for social recovery
+app.post('/api/recovery/trusted/setup', async (req, res) => {
+  const { ownerUsername, authKeyHash, contactUsername, encryptedPrivKey, contactEncryptedSecret } = req.body;
+  if (!ownerUsername || !authKeyHash || !contactUsername || !encryptedPrivKey || !contactEncryptedSecret) {
+    return res.status(400).json({ error: 'Missing trusted contact parameters' });
+  }
+
+  const cleanOwner = ownerUsername.trim().toLowerCase();
+  const cleanContact = contactUsername.trim().toLowerCase();
+
+  if (cleanOwner === cleanContact) {
+    return res.status(400).json({ error: 'Cannot set yourself as your own trusted contact' });
+  }
+
+  try {
+    const owner = await db.get('SELECT auth_key_hash FROM users WHERE LOWER(username) = ?', [cleanOwner]);
+    if (!owner || owner.auth_key_hash !== authKeyHash) {
+      return res.status(401).json({ error: 'Authentication failed' });
+    }
+
+    const contact = await db.get('SELECT username, identity_pub_key FROM users WHERE LOWER(username) = ?', [cleanContact]);
+    if (!contact) {
+      return res.status(404).json({ error: 'Contact user does not exist' });
+    }
+
+    // Insert or replace into trusted_recovery
+    await db.run(
+      'INSERT INTO trusted_recovery (owner_username, contact_username, encrypted_priv_key, contact_encrypted_secret, status) VALUES (?, ?, ?, ?, "active") ON CONFLICT(owner_username) DO UPDATE SET contact_username = excluded.contact_username, encrypted_priv_key = excluded.encrypted_priv_key, contact_encrypted_secret = excluded.contact_encrypted_secret, status = "active", created_at = CURRENT_TIMESTAMP',
+      [cleanOwner, cleanContact, encryptedPrivKey, contactEncryptedSecret]
+    );
+
+    res.json({ success: true, contactUsername: contact.username });
+  } catch (err) {
+    console.error('Trusted contact setup error:', err);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// Check status of trusted contact configuration for a user
+app.get('/api/recovery/trusted/status/:username', async (req, res) => {
+  const cleanUsername = (req.params.username || '').trim().toLowerCase();
+  if (!cleanUsername) return res.status(400).json({ error: 'Username required' });
+
+  try {
+    const row = await db.get('SELECT contact_username, created_at FROM trusted_recovery WHERE LOWER(owner_username) = ?', [cleanUsername]);
+    if (!row) {
+      return res.json({ hasTrustedContact: false });
+    }
+
+    // Mask contact for privacy e.g. "b***" or "s***h"
+    const name = row.contact_username;
+    const masked = name.length <= 2 ? `${name[0]}*` : `${name[0]}${'*'.repeat(Math.max(2, name.length - 2))}${name[name.length - 1]}`;
+
+    res.json({
+      hasTrustedContact: true,
+      contactMasked: masked,
+      contactUsername: row.contact_username,
+      createdAt: row.created_at
+    });
+  } catch (err) {
+    console.error('Trusted contact status error:', err);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// Initiate a recovery request to the user's trusted contact
+app.post('/api/recovery/trusted/request', async (req, res) => {
+  const { username } = req.body;
+  if (!username) return res.status(400).json({ error: 'Username required' });
+
+  const cleanUsername = username.trim().toLowerCase();
+  try {
+    const user = await db.get('SELECT username, identity_pub_key FROM users WHERE LOWER(username) = ?', [cleanUsername]);
+    if (!user) return res.status(404).json({ error: 'Account not found' });
+
+    const trusted = await db.get('SELECT contact_username, contact_encrypted_secret FROM trusted_recovery WHERE LOWER(owner_username) = ?', [cleanUsername]);
+    if (!trusted) {
+      return res.status(400).json({ error: 'No trusted recovery contact on file for this account' });
+    }
+
+    const requestId = `rec_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+
+    await db.run(
+      'INSERT INTO recovery_requests (request_id, requester, contact, status, expires_at) VALUES (?, ?, ?, "pending", ?)',
+      [requestId, cleanUsername, trusted.contact_username.toLowerCase(), expiresAt]
+    );
+
+    // Notify contact via WebSocket if online
+    const contactSocketId = onlineUsers.get(trusted.contact_username.toLowerCase());
+    if (contactSocketId) {
+      io.to(contactSocketId).emit('trusted_recovery_requested', {
+        requestId,
+        requester: user.username,
+        requesterPubKey: user.identity_pub_key,
+        contactEncryptedSecret: trusted.contact_encrypted_secret,
+        expiresAt
+      });
+      console.log(`[Recovery] Real-time alert emitted to contact @${trusted.contact_username} for requester @${user.username}`);
+    }
+
+    // Also dispatch Expo Push Notification if contact has a push token
+    const contactUser = await db.get('SELECT push_token FROM users WHERE LOWER(username) = ?', [trusted.contact_username.toLowerCase()]);
+    if (contactUser && contactUser.push_token) {
+      sendExpoPushNotification(
+        contactUser.push_token,
+        '⚠️ Action Required: Account Recovery Request',
+        `@${user.username} is requesting your help to recover their account. Tap to verify and approve.`,
+        { type: 'recovery_request', requestId, requester: user.username }
+      ).catch(() => {});
+    }
+
+    const name = trusted.contact_username;
+    const masked = name.length <= 2 ? `${name[0]}*` : `${name[0]}${'*'.repeat(Math.max(2, name.length - 2))}${name[name.length - 1]}`;
+
+    res.json({
+      success: true,
+      requestId,
+      contactMasked: masked,
+      expiresAt
+    });
+  } catch (err) {
+    console.error('Recovery request error:', err);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// Fetch pending recovery requests for a contact
+app.get('/api/recovery/trusted/pending/:username', async (req, res) => {
+  const cleanUsername = (req.params.username || '').trim().toLowerCase();
+  if (!cleanUsername) return res.status(400).json({ error: 'Username required' });
+
+  try {
+    const rows = await db.all(
+      `SELECT r.request_id, r.requester, r.created_at, r.expires_at, u.identity_pub_key, t.contact_encrypted_secret 
+       FROM recovery_requests r 
+       JOIN users u ON LOWER(u.username) = LOWER(r.requester)
+       JOIN trusted_recovery t ON LOWER(t.owner_username) = LOWER(r.requester)
+       WHERE LOWER(r.contact) = LOWER(?) AND r.status = 'pending' AND datetime(r.expires_at) > datetime('now')`,
+      [cleanUsername]
+    );
+
+    res.json({ pending: rows });
+  } catch (err) {
+    console.error('Fetch pending recovery error:', err);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// Trusted contact approves recovery request and submits encrypted secret + codeHash
+app.post('/api/recovery/trusted/approve', async (req, res) => {
+  const { requestId, contactUsername, authKeyHash, codeEncryptedSecret, codeHash } = req.body;
+  if (!requestId || !contactUsername || !authKeyHash || !codeEncryptedSecret || !codeHash) {
+    return res.status(400).json({ error: 'Missing approval parameters' });
+  }
+
+  const cleanContact = contactUsername.trim().toLowerCase();
+  try {
+    const contactUser = await db.get('SELECT auth_key_hash FROM users WHERE LOWER(username) = ?', [cleanContact]);
+    if (!contactUser || contactUser.auth_key_hash !== authKeyHash) {
+      return res.status(401).json({ error: 'Authentication failed' });
+    }
+
+    const request = await db.get('SELECT request_id, requester, status, expires_at FROM recovery_requests WHERE request_id = ?', [requestId]);
+    if (!request || request.status !== 'pending') {
+      return res.status(400).json({ error: 'Recovery request is no longer active' });
+    }
+
+    await db.run(
+      'UPDATE recovery_requests SET status = "approved", code_encrypted_secret = ?, code_hash = ? WHERE request_id = ?',
+      [codeEncryptedSecret, codeHash, requestId]
+    );
+
+    // Notify requester if online or polling
+    io.emit('trusted_recovery_approved', { requestId });
+    console.log(`[Recovery] Request ${requestId} approved by @${cleanContact}`);
+
+    res.json({ success: true, message: 'Recovery request approved' });
+  } catch (err) {
+    console.error('Approve recovery error:', err);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// Trusted contact rejects recovery request
+app.post('/api/recovery/trusted/reject', async (req, res) => {
+  const { requestId, contactUsername, authKeyHash } = req.body;
+  if (!requestId || !contactUsername || !authKeyHash) {
+    return res.status(400).json({ error: 'Missing parameters' });
+  }
+
+  const cleanContact = contactUsername.trim().toLowerCase();
+  try {
+    const contactUser = await db.get('SELECT auth_key_hash FROM users WHERE LOWER(username) = ?', [cleanContact]);
+    if (!contactUser || contactUser.auth_key_hash !== authKeyHash) {
+      return res.status(401).json({ error: 'Authentication failed' });
+    }
+
+    await db.run('UPDATE recovery_requests SET status = "rejected" WHERE request_id = ?', [requestId]);
+    io.emit('trusted_recovery_rejected', { requestId });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Reject recovery error:', err);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// Requester polls status of recovery request
+app.get('/api/recovery/trusted/poll/:requestId', async (req, res) => {
+  const { requestId } = req.params;
+  try {
+    const request = await db.get('SELECT request_id, requester, status, code_encrypted_secret FROM recovery_requests WHERE request_id = ?', [requestId]);
+    if (!request) return res.status(404).json({ error: 'Request not found' });
+
+    if (request.status === 'approved') {
+      const requesterUser = await db.get('SELECT identity_pub_key FROM users WHERE LOWER(username) = ?', [request.requester.toLowerCase()]);
+      const trusted = await db.get('SELECT encrypted_priv_key FROM trusted_recovery WHERE LOWER(owner_username) = ?', [request.requester.toLowerCase()]);
+      return res.json({
+        status: 'approved',
+        codeEncryptedSecret: request.code_encrypted_secret,
+        requesterPubKey: requesterUser ? requesterUser.identity_pub_key : null,
+        trustedEncryptedPrivKey: trusted ? trusted.encrypted_priv_key : null
+      });
+    }
+
+    res.json({ status: request.status });
+  } catch (err) {
+    console.error('Poll recovery error:', err);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// Requester completes recovery with PIN and supplies new credentials
+app.post('/api/recovery/trusted/complete', async (req, res) => {
+  const { requestId, recoveryPin, newAuthKeyHash, newEncryptedPrivKey, newRecoveryEncryptedPrivKey } = req.body;
+  if (!requestId || !recoveryPin || !newAuthKeyHash || !newEncryptedPrivKey) {
+    return res.status(400).json({ error: 'Missing parameters to complete recovery' });
+  }
+
+  try {
+    const request = await db.get('SELECT requester, status, code_hash FROM recovery_requests WHERE request_id = ?', [requestId]);
+    if (!request || request.status !== 'approved') {
+      return res.status(400).json({ error: 'Recovery session is not approved or has expired' });
+    }
+
+    const computedHash = crypto.createHash('sha256').update(recoveryPin.trim()).digest('hex');
+    if (computedHash !== request.code_hash) {
+      return res.status(401).json({ error: 'Incorrect 6-digit recovery code' });
+    }
+
+    const cleanUsername = request.requester.toLowerCase();
+    await db.run(
+      'UPDATE users SET auth_key_hash = ?, encrypted_priv_key = ?, recovery_encrypted_priv_key = COALESCE(?, recovery_encrypted_priv_key) WHERE LOWER(username) = ?',
+      [newAuthKeyHash, newEncryptedPrivKey, newRecoveryEncryptedPrivKey || null, cleanUsername]
+    );
+
+    await db.run('UPDATE recovery_requests SET status = "completed" WHERE request_id = ?', [requestId]);
+
+    console.log(`[Recovery] Trusted social recovery completed successfully for @${cleanUsername}`);
+    res.json({ success: true, message: 'Account successfully restored' });
+  } catch (err) {
+    console.error('Complete trusted recovery error:', err);
+    res.status(500).json({ error: 'Database error' });
   }
 });
 

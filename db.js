@@ -75,7 +75,30 @@ const schemaQueries = [
     username TEXT NOT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`,
-  `CREATE INDEX IF NOT EXISTS idx_device_creations_dev_time ON device_creations(device_id, created_at)`
+  `CREATE INDEX IF NOT EXISTS idx_device_creations_dev_time ON device_creations(device_id, created_at)`,
+
+  `CREATE TABLE IF NOT EXISTS trusted_recovery (
+    owner_username TEXT PRIMARY KEY,
+    contact_username TEXT NOT NULL,
+    encrypted_priv_key TEXT NOT NULL,
+    contact_encrypted_secret TEXT NOT NULL,
+    status TEXT DEFAULT 'active',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_trusted_recovery_contact ON trusted_recovery(contact_username)`,
+
+  `CREATE TABLE IF NOT EXISTS recovery_requests (
+    request_id TEXT PRIMARY KEY,
+    requester TEXT NOT NULL,
+    contact TEXT NOT NULL,
+    code_encrypted_secret TEXT,
+    code_hash TEXT,
+    status TEXT DEFAULT 'pending',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    expires_at DATETIME
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_recovery_requests_contact ON recovery_requests(contact, status)`,
+  `CREATE INDEX IF NOT EXISTS idx_recovery_requests_req ON recovery_requests(requester, status)`
 ];
 
 if (isTurso) {
@@ -108,6 +131,9 @@ if (isTurso) {
       for (const q of schemaQueries) {
         await client.execute(q);
       }
+      try {
+        await client.execute("ALTER TABLE users ADD COLUMN recovery_encrypted_priv_key TEXT");
+      } catch (_) {}
       console.log('✅ Turso Cloud SQLite schema initialized and persistent.');
     } catch (err) {
       console.error('Error initializing Turso schema:', err);
@@ -138,6 +164,7 @@ if (isTurso) {
     db.run("ALTER TABLE users ADD COLUMN avatar TEXT", () => {});
     db.run("ALTER TABLE users ADD COLUMN about TEXT DEFAULT '🔒 NosePies E2EE Active • PFS Verified'", () => {});
     db.run("ALTER TABLE users ADD COLUMN show_online_status INTEGER DEFAULT 1", () => {});
+    db.run("ALTER TABLE users ADD COLUMN recovery_encrypted_priv_key TEXT", () => {});
     db.run("ALTER TABLE queued_messages ADD COLUMN message_id TEXT", () => {});
     db.run("ALTER TABLE queued_messages ADD COLUMN timestamp TEXT", () => {});
     db.run("ALTER TABLE vault_messages ADD COLUMN status TEXT DEFAULT 'sent'", () => {});
