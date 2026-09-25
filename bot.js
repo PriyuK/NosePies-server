@@ -165,14 +165,27 @@ async function handleBotMessage({ messageId, sender, encryptedPayloadStr, io, on
         [botMsgId, BOT_USERNAME, sender, replyPayloadStr, 'read', new Date().toISOString()]
       ).catch(() => {});
 
-      if (senderSocketId) {
-        io.to(senderSocketId).emit('typing_status', { sender: BOT_USERNAME, isTyping: false });
-        io.to(senderSocketId).emit('receive_message', {
+      const cleanSender = sender.toLowerCase();
+      const senderRoom = io.sockets.adapter.rooms.get(`user:${cleanSender}`);
+      const isSenderActive = (senderRoom && senderRoom.size > 0) || senderSocketId;
+
+      if (isSenderActive) {
+        io.to(`user:${cleanSender}`).emit('typing_status', { sender: BOT_USERNAME, isTyping: false });
+        io.to(`user:${cleanSender}`).emit('receive_message', {
           messageId: botMsgId,
           sender: BOT_USERNAME,
           encryptedPayload: replyPayloadStr,
           timestamp: new Date().toISOString()
         });
+        if (senderSocketId && (!senderRoom || !senderRoom.has(senderSocketId))) {
+          io.to(senderSocketId).emit('typing_status', { sender: BOT_USERNAME, isTyping: false });
+          io.to(senderSocketId).emit('receive_message', {
+            messageId: botMsgId,
+            sender: BOT_USERNAME,
+            encryptedPayload: replyPayloadStr,
+            timestamp: new Date().toISOString()
+          });
+        }
         console.log(`🤖 NosePies Bot sent forward-secret encrypted reply to ${sender} [Ratchet #${replyCounter}]`);
       } else {
         // Queue for sender if they disconnected

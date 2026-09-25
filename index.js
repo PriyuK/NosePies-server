@@ -16,7 +16,10 @@ const io = socketIo(server, {
   cors: {
     origin: '*',
     methods: ['GET', 'POST']
-  }
+  },
+  pingInterval: 15000,
+  pingTimeout: 20000,
+  transports: ['websocket', 'polling']
 });
 
 // Map to keep track of active WebSocket connections
@@ -822,8 +825,13 @@ io.on('connection', (socket) => {
 
       socket.username = username;
       const lowerUsername = username.toLowerCase();
+      socket.cleanUsername = lowerUsername;
+
+      // Join personal room for resilient message delivery across reconnections
+      socket.join(`user:${lowerUsername}`);
       onlineUsers.set(lowerUsername, socket.id);
-      console.log(`User ${username} authenticated on socket ${socket.id}`);
+      onlineUsers.set(username, socket.id);
+      console.log(`User ${username} authenticated on socket ${socket.id} (joined user:${lowerUsername})`);
 
       // Determine visibility: explicit client param or saved preference in DB (default 1 / true)
       const isVisible = showOnlineStatus !== undefined 
@@ -832,10 +840,12 @@ io.on('connection', (socket) => {
 
       if (isVisible) {
         hiddenOnlineUsers.delete(username);
+        hiddenOnlineUsers.delete(lowerUsername);
         // Broadcast online status change to peers
         io.emit('status_change', { username, status: 'online' });
       } else {
         hiddenOnlineUsers.add(username);
+        hiddenOnlineUsers.add(lowerUsername);
         console.log(`User ${username} connected in Ghost Mode (online status hidden)`);
       }
       
@@ -844,6 +854,11 @@ io.on('connection', (socket) => {
       console.error('Socket auth error:', err);
       socket.disconnect();
     }
+  });
+
+  // Keep-alive heartbeat to prevent cloud proxies from dropping idle connections
+  socket.on('ping_keepalive', () => {
+    socket.emit('pong_keepalive', { time: Date.now() });
   });
 
   // Register push token for socket session
@@ -861,15 +876,18 @@ io.on('connection', (socket) => {
   socket.on('set_online_privacy', async ({ showOnlineStatus }, callback) => {
     if (!socket.username) return;
     const username = socket.username;
+    const lowerUsername = username.toLowerCase();
     const isVisible = showOnlineStatus !== false;
     try {
       if (isVisible) {
         hiddenOnlineUsers.delete(username);
+        hiddenOnlineUsers.delete(lowerUsername);
         await db.run('UPDATE users SET show_online_status = 1 WHERE username = ?', [username]);
         io.emit('status_change', { username, status: 'online' });
         console.log(`User ${username} enabled online status visibility`);
       } else {
         hiddenOnlineUsers.add(username);
+        hiddenOnlineUsers.add(lowerUsername);
         await db.run('UPDATE users SET show_online_status = 0 WHERE username = ?', [username]);
         io.emit('status_change', { username, status: 'offline' });
         console.log(`User ${username} hid online status (Ghost Mode active)`);
@@ -926,12 +944,16 @@ io.on('connection', (socket) => {
   socket.on('check_online', (usernames, callback) => {
     const statuses = {};
     usernames.forEach(name => {
+      const lower = name.toLowerCase();
+      const room = io.sockets.adapter.rooms.get(`user:${lower}`);
+      const hasActiveSockets = (room && room.size > 0) || onlineUsers.has(lower) || onlineUsers.has(name);
+
       if (bot.isBot(name)) {
         statuses[name] = 'online';
-      } else if (hiddenOnlineUsers.has(name)) {
+      } else if (hiddenOnlineUsers.has(name) || hiddenOnlineUsers.has(lower)) {
         statuses[name] = 'offline';
       } else {
-        statuses[name] = onlineUsers.has(name) ? 'online' : 'offline';
+        statuses[name] = hasActiveSockets ? 'online' : 'offline';
       }
     });
     callback(statuses);
@@ -944,8 +966,10 @@ io.on('connection', (socket) => {
     try {
       const finalMsgId = messageId || (Date.now().toString() + '_' + Math.random().toString(36).substr(2, 6));
       const nowIso = new Date().toISOString();
+      const cleanRecipient = recipient.trim().toLowerCase();
       const isRecipientBot = bot.isBot(recipient);
-      const isRecipientOnline = onlineUsers.has(recipient.toLowerCase()) || onlineUsers.has(recipient);
+      const recipientRoom = io.sockets.adapter.rooms.get(`user:${cleanRecipient}`);
+      const isRecipientOnline = (recipientRoom && recipientRoom.size > 0) || onlineUsers.has(cleanRecipient) || onlineUsers.has(recipient);
       const initialStatus = isRecipientBot ? 'read' : (isRecipientOnline ? 'delivered' : 'sent');
 
       // Always persist opaque ciphertext with initial delivery/read status in vault
@@ -967,19 +991,29 @@ io.on('connection', (socket) => {
         return;
       }
 
-      const recipientSocketId = onlineUsers.get(recipient.toLowerCase()) || onlineUsers.get(recipient);
-      
-      if (recipientSocketId) {
-        // Recipient is online, relay instantly
-        io.to(recipientSocketId).emit('receive_message', {
+      if (isRecipientOnline) {
+        // Recipient is online: relay instantly via dedicated room and direct socket
+        io.to(`user:${cleanRecipient}`).emit('receive_message', {
           messageId: finalMsgId,
           sender: socket.username,
           encryptedPayload,
           timestamp: nowIso
         });
+
+        // Also emit directly to socketId if room membership is updating
+        const recipientSocketId = onlineUsers.get(cleanRecipient) || onlineUsers.get(recipient);
+        if (recipientSocketId && (!recipientRoom || !recipientRoom.has(recipientSocketId))) {
+          io.to(recipientSocketId).emit('receive_message', {
+            messageId: finalMsgId,
+            sender: socket.username,
+            encryptedPayload,
+            timestamp: nowIso
+          });
+        }
+
         // Immediately acknowledge delivery to sender
         socket.emit('message_delivered', { messageId: finalMsgId, recipient });
-        console.log(`Relayed E2E message from ${socket.username} to ${recipient} (online)`);
+        console.log(`Relayed E2E message from ${socket.username} to ${recipient} (online in room user:${cleanRecipient})`);
       } else {
         // Recipient is offline, queue message
         await db.run(
@@ -989,7 +1023,7 @@ io.on('connection', (socket) => {
         console.log(`Queued E2E message from ${socket.username} to ${recipient} (offline, id: ${finalMsgId})`);
 
         // Send Expo push notification if recipient has registered a push token
-        db.get('SELECT push_token FROM users WHERE LOWER(username) = ?', [recipient.toLowerCase()])
+        db.get('SELECT push_token FROM users WHERE LOWER(username) = ?', [cleanRecipient])
           .then(recipientUser => {
             if (recipientUser && recipientUser.push_token) {
               sendExpoPushNotification(
@@ -1037,10 +1071,13 @@ io.on('connection', (socket) => {
     if (messageId) {
       await db.run("UPDATE vault_messages SET status = 'delivered' WHERE id = ? AND status != 'read'", [messageId]).catch(() => {});
     }
-    const senderSocketId = onlineUsers.get(sender);
+    const cleanSender = sender.trim().toLowerCase();
+    io.to(`user:${cleanSender}`).emit('message_delivered', { messageId, recipient: socket.username });
+    const senderSocketId = onlineUsers.get(cleanSender) || onlineUsers.get(sender);
     if (senderSocketId) {
       io.to(senderSocketId).emit('message_delivered', { messageId, recipient: socket.username });
-    } else if (messageId) {
+    }
+    if (!onlineUsers.has(cleanSender) && messageId) {
       // Queue delivery receipt for offline sender
       await db.run(
         "INSERT INTO queued_receipts (recipient, sender, message_id, status) VALUES (?, ?, ?, 'delivered')",
@@ -1065,10 +1102,13 @@ io.on('connection', (socket) => {
       ).catch(() => {});
     }
 
-    const senderSocketId = onlineUsers.get(sender);
+    const cleanSender = sender.trim().toLowerCase();
+    io.to(`user:${cleanSender}`).emit('message_read', { messageIds, recipient: socket.username });
+    const senderSocketId = onlineUsers.get(cleanSender) || onlineUsers.get(sender);
     if (senderSocketId) {
       io.to(senderSocketId).emit('message_read', { messageIds, recipient: socket.username });
-    } else if (Array.isArray(messageIds) && messageIds.length > 0) {
+    }
+    if (!onlineUsers.has(cleanSender) && Array.isArray(messageIds) && messageIds.length > 0) {
       // Queue read receipt for offline sender
       for (const mid of messageIds) {
         await db.run(
@@ -1082,7 +1122,9 @@ io.on('connection', (socket) => {
   // Typing indicators
   socket.on('typing_start', ({ recipient }) => {
     if (!recipient) return;
-    const recipientSocketId = onlineUsers.get(recipient);
+    const cleanRecipient = recipient.trim().toLowerCase();
+    io.to(`user:${cleanRecipient}`).emit('typing_status', { sender: socket.username, isTyping: true });
+    const recipientSocketId = onlineUsers.get(cleanRecipient) || onlineUsers.get(recipient);
     if (recipientSocketId) {
       io.to(recipientSocketId).emit('typing_status', { sender: socket.username, isTyping: true });
     }
@@ -1090,7 +1132,9 @@ io.on('connection', (socket) => {
 
   socket.on('typing_stop', ({ recipient }) => {
     if (!recipient) return;
-    const recipientSocketId = onlineUsers.get(recipient);
+    const cleanRecipient = recipient.trim().toLowerCase();
+    io.to(`user:${cleanRecipient}`).emit('typing_status', { sender: socket.username, isTyping: false });
+    const recipientSocketId = onlineUsers.get(cleanRecipient) || onlineUsers.get(recipient);
     if (recipientSocketId) {
       io.to(recipientSocketId).emit('typing_status', { sender: socket.username, isTyping: false });
     }
@@ -1114,7 +1158,13 @@ io.on('connection', (socket) => {
       return;
     }
 
-    const recipientSocketId = onlineUsers.get(recipient.toLowerCase());
+    const cleanRecipient = recipient.trim().toLowerCase();
+    io.to(`user:${cleanRecipient}`).emit('message_reaction', {
+      messageId,
+      sender: socket.username,
+      emoji
+    });
+    const recipientSocketId = onlineUsers.get(cleanRecipient) || onlineUsers.get(recipient);
     if (recipientSocketId) {
       io.to(recipientSocketId).emit('message_reaction', {
         messageId,
@@ -1127,13 +1177,34 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {
     if (socket.username) {
       const username = socket.username;
-      onlineUsers.delete(username);
-      onlineUsers.delete(username.toLowerCase());
-      hiddenOnlineUsers.delete(username);
-      hiddenOnlineUsers.delete(username.toLowerCase());
-      console.log(`User ${username} disconnected`);
-      // Broadcast offline status change
-      io.emit('status_change', { username, status: 'offline' });
+      const lowerUsername = socket.cleanUsername || username.toLowerCase();
+      
+      const userRoom = io.sockets.adapter.rooms.get(`user:${lowerUsername}`);
+      const remainingSockets = userRoom ? userRoom.size : 0;
+
+      // Only clean up onlineUsers map if the disconnected socket was the one registered
+      if (onlineUsers.get(lowerUsername) === socket.id) {
+        if (remainingSockets > 0) {
+          // Point to another active socket connection for this user
+          const nextSocketId = Array.from(userRoom)[0];
+          onlineUsers.set(lowerUsername, nextSocketId);
+          onlineUsers.set(username, nextSocketId);
+          console.log(`Socket ${socket.id} closed for ${username}, switched active socket to ${nextSocketId}`);
+        } else {
+          onlineUsers.delete(username);
+          onlineUsers.delete(lowerUsername);
+        }
+      }
+
+      // Only broadcast offline status if user has NO active connections remaining
+      if (remainingSockets === 0) {
+        hiddenOnlineUsers.delete(username);
+        hiddenOnlineUsers.delete(lowerUsername);
+        console.log(`User ${username} completely disconnected (0 active sockets)`);
+        io.emit('status_change', { username, status: 'offline' });
+      } else {
+        console.log(`Socket ${socket.id} disconnected for ${username}, but ${remainingSockets} socket(s) still active in room user:${lowerUsername}`);
+      }
     }
   });
 });
