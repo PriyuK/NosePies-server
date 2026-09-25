@@ -1119,6 +1119,58 @@ io.on('connection', (socket) => {
     }
   });
 
+  // Handle editing an already sent message (within 1 hour limit)
+  socket.on('edit_message', async ({ messageId, recipient, newEncryptedPayload, editedAt, newText }) => {
+    if (!socket.username || !recipient || !messageId) return;
+
+    try {
+      const cleanRecipient = recipient.trim().toLowerCase();
+      const sender = socket.username;
+
+      // 1. If recipient is bot, acknowledge
+      if (bot.isBot(cleanRecipient)) {
+        console.log(`[Bot] Message ${messageId} was edited by ${sender}`);
+        return;
+      }
+
+      // 2. Update ciphertext in vault_messages and queued_messages
+      if (newEncryptedPayload) {
+        await db.run(
+          'UPDATE vault_messages SET encrypted_payload = ? WHERE id = ? AND LOWER(sender) = LOWER(?)',
+          [newEncryptedPayload, messageId, sender]
+        ).catch(() => {});
+
+        await db.run(
+          'UPDATE queued_messages SET encrypted_payload = ? WHERE (message_id = ? OR id = ?) AND LOWER(sender) = LOWER(?)',
+          [newEncryptedPayload, messageId, messageId, sender]
+        ).catch(() => {});
+      }
+
+      // 3. Relay edited event to recipient's room
+      io.to(`user:${cleanRecipient}`).emit('message_edited', {
+        messageId,
+        sender,
+        newEncryptedPayload,
+        editedAt: editedAt || new Date().toISOString(),
+        newText
+      });
+
+      const recipientSocketId = onlineUsers.get(cleanRecipient) || onlineUsers.get(recipient);
+      if (recipientSocketId) {
+        io.to(recipientSocketId).emit('message_edited', {
+          messageId,
+          sender,
+          newEncryptedPayload,
+          editedAt: editedAt || new Date().toISOString(),
+          newText
+        });
+      }
+      console.log(`[Edit] Relayed message edit (${messageId}) from @${sender} to @${cleanRecipient}`);
+    } catch (err) {
+      console.error('Edit message error on server:', err);
+    }
+  });
+
   // Typing indicators
   socket.on('typing_start', ({ recipient }) => {
     if (!recipient) return;
