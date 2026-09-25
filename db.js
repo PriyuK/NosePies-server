@@ -98,7 +98,28 @@ const schemaQueries = [
     expires_at DATETIME
   )`,
   `CREATE INDEX IF NOT EXISTS idx_recovery_requests_contact ON recovery_requests(contact, status)`,
-  `CREATE INDEX IF NOT EXISTS idx_recovery_requests_req ON recovery_requests(requester, status)`
+  `CREATE INDEX IF NOT EXISTS idx_recovery_requests_req ON recovery_requests(requester, status)`,
+
+  `CREATE TABLE IF NOT EXISTS user_blocks (
+    blocker TEXT NOT NULL,
+    blocked TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (blocker, blocked)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_user_blocks_pair ON user_blocks(blocker, blocked)`,
+
+  `CREATE TABLE IF NOT EXISTS user_reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reporter TEXT NOT NULL,
+    reported_user TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    details TEXT,
+    evidence_json TEXT,
+    status TEXT DEFAULT 'pending',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_user_reports_status ON user_reports(status)`,
+  `CREATE INDEX IF NOT EXISTS idx_user_reports_reported ON user_reports(reported_user)`
 ];
 
 if (isTurso) {

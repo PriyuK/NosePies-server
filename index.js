@@ -807,6 +807,109 @@ app.post('/api/recovery/trusted/complete', async (req, res) => {
   }
 });
 
+// --- Block and Report User Routes ---
+
+// Block a contact
+app.post('/api/users/block', async (req, res) => {
+  const { blocker, authKeyHash, blocked } = req.body;
+  if (!blocker || !authKeyHash || !blocked) {
+    return res.status(400).json({ error: 'Missing block parameters' });
+  }
+
+  const cleanBlocker = blocker.trim().toLowerCase();
+  const cleanBlocked = blocked.trim().toLowerCase();
+
+  try {
+    const user = await db.get('SELECT auth_key_hash FROM users WHERE LOWER(username) = ?', [cleanBlocker]);
+    if (!user || user.auth_key_hash !== authKeyHash) {
+      return res.status(401).json({ error: 'Authentication failed' });
+    }
+
+    await db.run(
+      'INSERT OR IGNORE INTO user_blocks (blocker, blocked) VALUES (?, ?)',
+      [cleanBlocker, cleanBlocked]
+    );
+
+    console.log(`[BLOCK] @${cleanBlocker} blocked @${cleanBlocked}`);
+    res.json({ success: true, message: `User @${cleanBlocked} blocked successfully` });
+  } catch (err) {
+    console.error('Block user error:', err);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// Unblock a contact
+app.post('/api/users/unblock', async (req, res) => {
+  const { blocker, authKeyHash, blocked } = req.body;
+  if (!blocker || !authKeyHash || !blocked) {
+    return res.status(400).json({ error: 'Missing unblock parameters' });
+  }
+
+  const cleanBlocker = blocker.trim().toLowerCase();
+  const cleanBlocked = blocked.trim().toLowerCase();
+
+  try {
+    const user = await db.get('SELECT auth_key_hash FROM users WHERE LOWER(username) = ?', [cleanBlocker]);
+    if (!user || user.auth_key_hash !== authKeyHash) {
+      return res.status(401).json({ error: 'Authentication failed' });
+    }
+
+    await db.run(
+      'DELETE FROM user_blocks WHERE LOWER(blocker) = ? AND LOWER(blocked) = ?',
+      [cleanBlocker, cleanBlocked]
+    );
+
+    console.log(`[UNBLOCK] @${cleanBlocker} unblocked @${cleanBlocked}`);
+    res.json({ success: true, message: `User @${cleanBlocked} unblocked successfully` });
+  } catch (err) {
+    console.error('Unblock user error:', err);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// Submit user report (supports optional decrypted evidence snippets forwarded by user)
+app.post('/api/reports', async (req, res) => {
+  const { reporter, authKeyHash, reportedUser, reason, details, evidence } = req.body;
+  if (!reporter || !authKeyHash || !reportedUser || !reason) {
+    return res.status(400).json({ error: 'Missing required report fields' });
+  }
+
+  const cleanReporter = reporter.trim().toLowerCase();
+  const cleanReported = reportedUser.trim().toLowerCase();
+
+  try {
+    const user = await db.get('SELECT auth_key_hash FROM users WHERE LOWER(username) = ?', [cleanReporter]);
+    if (!user || user.auth_key_hash !== authKeyHash) {
+      return res.status(401).json({ error: 'Authentication failed' });
+    }
+
+    const evidenceJson = evidence ? JSON.stringify(evidence) : null;
+    await db.run(
+      'INSERT INTO user_reports (reporter, reported_user, reason, details, evidence_json) VALUES (?, ?, ?, ?, ?)',
+      [cleanReporter, cleanReported, reason.trim(), details ? details.trim() : '', evidenceJson]
+    );
+
+    console.log(`[REPORT SUBMITTED] @${cleanReporter} reported @${cleanReported} for "${reason}"`);
+    res.json({ success: true, message: 'Report submitted successfully. Thank you for keeping the platform safe.' });
+  } catch (err) {
+    console.error('Report submission error:', err);
+    res.status(500).json({ error: 'Database error saving report' });
+  }
+});
+
+// Admin review reports endpoint
+app.get('/api/reports', async (req, res) => {
+  try {
+    const reports = await db.all(
+      'SELECT id, reporter, reported_user, reason, details, evidence_json, status, created_at FROM user_reports ORDER BY created_at DESC LIMIT 100'
+    );
+    res.json({ reports });
+  } catch (err) {
+    console.error('Fetch reports error:', err);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
 
 // --- WebSocket Socket.io Logic ---
 
@@ -971,6 +1074,19 @@ io.on('connection', (socket) => {
       const recipientRoom = io.sockets.adapter.rooms.get(`user:${cleanRecipient}`);
       const isRecipientOnline = (recipientRoom && recipientRoom.size > 0) || onlineUsers.has(cleanRecipient) || onlineUsers.has(recipient);
       const initialStatus = isRecipientBot ? 'read' : (isRecipientOnline ? 'delivered' : 'sent');
+
+      // Check if recipient has blocked this sender
+      if (!isRecipientBot) {
+        const isBlocked = await db.get(
+          'SELECT 1 FROM user_blocks WHERE LOWER(blocker) = ? AND LOWER(blocked) = ?',
+          [cleanRecipient, (socket.cleanUsername || socket.username).toLowerCase()]
+        );
+        if (isBlocked) {
+          socket.emit('message_delivered', { messageId: finalMsgId, recipient });
+          console.log(`[BLOCK] Silently discarded message from @${socket.username} to @${recipient} (blocked)`);
+          return;
+        }
+      }
 
       // Always persist opaque ciphertext with initial delivery/read status in vault
       db.run(
