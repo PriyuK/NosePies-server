@@ -911,6 +911,142 @@ app.get('/api/reports', async (req, res) => {
 });
 
 
+// ==========================================
+// VAULT SHIELD: Anonymous Web Proxy Relay
+// Masks client IP, strips trackers/cookies,
+// neutralizes malicious downloads & SSRF attacks
+// ==========================================
+app.get('/api/proxy', async (req, res) => {
+  const targetUrlStr = req.query.url;
+  if (!targetUrlStr || typeof targetUrlStr !== 'string') {
+    return res.status(400).send('Target URL query parameter "url" is required.');
+  }
+
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(targetUrlStr);
+  } catch (err) {
+    return res.status(400).send('Invalid target URL.');
+  }
+
+  // Security: Protocol whitelist
+  if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
+    return res.status(400).send('Blocked: Only HTTP and HTTPS protocols are permitted through the proxy.');
+  }
+
+  // Security: SSRF Protection (Block localhost and private subnet IP ranges)
+  const hostname = parsedUrl.hostname.toLowerCase();
+  const isPrivateIp =
+    hostname === 'localhost' ||
+    hostname === '127.0.0.1' ||
+    hostname === '0.0.0.0' ||
+    hostname === '::1' ||
+    /^10\./.test(hostname) ||
+    /^192\.168\./.test(hostname) ||
+    /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(hostname) ||
+    /^169\.254\./.test(hostname) ||
+    hostname.endsWith('.local') ||
+    hostname.endsWith('.internal');
+
+  if (isPrivateIp) {
+    return res.status(403).send('Blocked: Access to internal / private network resources is forbidden.');
+  }
+
+  // Security: Block direct executable/malware file extensions
+  const dangerousExts = ['.apk', '.exe', '.bat', '.scr', '.vbs', '.msi', '.cmd', '.pif', '.reg', '.dmg', '.iso'];
+  const pathname = parsedUrl.pathname.toLowerCase();
+  if (dangerousExts.some(ext => pathname.endsWith(ext))) {
+    return res.status(403).send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Vault Shield: Threat Blocked</title>
+        <style>
+          body { background: #07090e; color: #ffffff; font-family: -apple-system, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; padding: 24px; box-sizing: border-box; }
+          .card { background: #0d121c; border: 1px solid #ef4444; border-radius: 16px; padding: 28px; max-width: 440px; text-align: center; }
+          h2 { color: #ef4444; margin-top: 0; font-size: 20px; }
+          p { color: #8b97a8; font-size: 14px; line-height: 1.6; }
+          .badge { display: inline-block; background: rgba(239, 68, 68, 0.15); color: #ef4444; padding: 6px 14px; border-radius: 20px; font-weight: 700; font-size: 12px; margin-bottom: 14px; }
+        </style>
+      </head>
+      <body>
+        <div class="card">
+          <div class="badge">SHIELD DEFENSE ACTIVE</div>
+          <h2>Direct Executable Download Blocked</h2>
+          <p>Vault Shield intercepted a direct binary download attempt from <strong>${hostname}</strong>. Executable files are blocked through the proxy to prevent drive-by malware infections.</p>
+        </div>
+      </body>
+      </html>
+    `);
+  }
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15000);
+
+    const response = await fetch(parsedUrl.href, {
+      method: 'GET',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 13; SM-G981B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
+      redirect: 'follow',
+      signal: controller.signal
+    });
+
+    clearTimeout(timeoutId);
+
+    const contentType = response.headers.get('content-type') || 'text/html';
+
+    // Set privacy & sandbox headers on our response to client
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('X-Vault-Shield', 'Active');
+    res.setHeader('X-Vault-Client-IP', 'Masked');
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+
+    // If it's HTML, inject <base> tag so relative styles, images, and links resolve seamlessly
+    if (contentType.includes('text/html')) {
+      let html = await response.text();
+      const baseTag = `<base href="${parsedUrl.origin}${parsedUrl.pathname}">\n<meta name="referrer" content="no-referrer">\n`;
+      if (/<head[^>]*>/i.test(html)) {
+        html = html.replace(/<head[^>]*>/i, `$&${baseTag}`);
+      } else {
+        html = baseTag + html;
+      }
+      return res.send(html);
+    } else {
+      const buffer = Buffer.from(await response.arrayBuffer());
+      return res.send(buffer);
+    }
+  } catch (err) {
+    console.error('[Vault Proxy] Error fetching target URL:', err.message);
+    return res.status(502).send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Vault Shield: Gateway Error</title>
+        <style>
+          body { background: #07090e; color: #ffffff; font-family: -apple-system, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; padding: 24px; box-sizing: border-box; }
+          .card { background: #0d121c; border: 1px solid #38bdf8; border-radius: 16px; padding: 28px; max-width: 440px; text-align: center; }
+          h2 { color: #38bdf8; margin-top: 0; font-size: 20px; }
+          p { color: #8b97a8; font-size: 14px; line-height: 1.6; }
+        </style>
+      </head>
+      <body>
+        <div class="card">
+          <h2>Proxy Gateway Timeout / Offline</h2>
+          <p>Could not securely connect to <strong>${hostname}</strong>. The target server may be offline, blocking cloud IPs, or refusing connections.</p>
+        </div>
+      </body>
+      </html>
+    `);
+  }
+});
+
+
 // --- WebSocket Socket.io Logic ---
 
 io.on('connection', (socket) => {
