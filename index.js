@@ -916,7 +916,15 @@ app.get('/api/reports', async (req, res) => {
 // Masks client IP, strips trackers/cookies,
 // neutralizes malicious downloads & SSRF attacks
 // ==========================================
-app.get('/api/proxy', async (req, res) => {
+app.all('/api/proxy', async (req, res) => {
+  // CORS Preflight Handler
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', '*');
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
+  }
+
   const targetUrlStr = req.query.url;
   if (!targetUrlStr || typeof targetUrlStr !== 'string') {
     return res.status(400).send('Target URL query parameter "url" is required.');
@@ -985,25 +993,31 @@ app.get('/api/proxy', async (req, res) => {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 15000);
 
-    const response = await fetch(parsedUrl.href, {
-      method: 'GET',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Linux; Android 13; SM-G981B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-      },
+    const fetchHeaders = {
+      'User-Agent': 'Mozilla/5.0 (Linux; Android 13; SM-G981B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Cookie': 'cookie_accept_v2=%7B%22e%22%3A1%2C%22f%22%3A1%2C%22t%22%3A1%2C%22a%22%3A1%7D; age_verified=1; over18=1',
+    };
+
+    const fetchOptions = {
+      method: req.method || 'GET',
+      headers: fetchHeaders,
       redirect: 'follow',
       signal: controller.signal
-    });
+    };
+
+    if (req.method !== 'GET' && req.method !== 'HEAD' && req.body) {
+      fetchOptions.body = typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
+    }
+
+    const response = await fetch(parsedUrl.href, fetchOptions);
 
     clearTimeout(timeoutId);
 
     const contentType = response.headers.get('content-type') || 'text/html';
 
     // Set CORS, privacy & sandbox headers on our response to client
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', '*');
     res.setHeader('Content-Type', contentType);
     res.setHeader('X-Vault-Shield', 'Active');
     res.setHeader('X-Vault-Client-IP', 'Masked');
@@ -1039,6 +1053,7 @@ app.get('/api/proxy', async (req, res) => {
       window.addEventListener('unhandledrejection', function(e) { e.preventDefault(); }, true);
       // 3. Disable alert/confirm spam
       window.confirm = function() { return true; };
+
       // 4. Force HTML5 video controls (Play, Pause, Forward, Seek scrubber)
       function forceVideoControls() {
         try {
@@ -1072,6 +1087,34 @@ app.get('/api/proxy', async (req, res) => {
           }
         }
       }, true);
+
+      // 6. Rewrite internal client-side fetch & xhr to proxy to eliminate CORS crashes
+      var originUrl = '${finalUrl.origin}';
+      var origFetch = window.fetch;
+      window.fetch = function(input, init) {
+        if (typeof input === 'string') {
+          var target = input;
+          if (target.startsWith('/')) target = originUrl + target;
+          if (!target.includes('/api/proxy?url=')) {
+            input = '/api/proxy?url=' + encodeURIComponent(target);
+          }
+        }
+        return origFetch.apply(this, arguments);
+      };
+
+      // 7. Auto-dismiss any stuck age gate or parental control modal overlays
+      function dismissAgeGate() {
+        try {
+          var btn = document.querySelector('[data-role="parental-control-confirm-button"]');
+          if (btn) btn.click();
+          var overlays = document.querySelectorAll('.background-cd15c, [data-opt-hydration="parental-control-dialog"]');
+          for (var j = 0; j < overlays.length; j++) {
+            overlays[j].style.display = 'none';
+          }
+        } catch (_) {}
+      }
+      setInterval(dismissAgeGate, 600);
+      document.addEventListener('DOMContentLoaded', dismissAgeGate);
     } catch (_) {}
   })();
 </script>
