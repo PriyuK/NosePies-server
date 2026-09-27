@@ -1013,6 +1013,8 @@ app.get('/api/proxy', async (req, res) => {
     const setCookie = response.headers.get('set-cookie');
     if (setCookie) {
       res.setHeader('Set-Cookie', setCookie);
+    }
+
     // Resolve final URL after all HTTP redirects
     let finalUrl = parsedUrl;
     if (response.url) {
