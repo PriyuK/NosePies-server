@@ -1000,20 +1000,45 @@ app.get('/api/proxy', async (req, res) => {
 
     const contentType = response.headers.get('content-type') || 'text/html';
 
-    // Set privacy & sandbox headers on our response to client
+    // Set CORS, privacy & sandbox headers on our response to client
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', '*');
     res.setHeader('Content-Type', contentType);
     res.setHeader('X-Vault-Shield', 'Active');
     res.setHeader('X-Vault-Client-IP', 'Masked');
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
 
-    // If it's HTML, inject <base> tag so relative styles, images, and links resolve seamlessly
+    // Forward session cookies if set (e.g. for age verification / token handshakes)
+    const setCookie = response.headers.get('set-cookie');
+    if (setCookie) {
+      res.setHeader('Set-Cookie', setCookie);
+    }
+
+    // If it's HTML, inject <base> tag and anti-crash / ad-shield protection
     if (contentType.includes('text/html')) {
       let html = await response.text();
-      const baseTag = `<base href="${parsedUrl.origin}${parsedUrl.pathname}">\n<meta name="referrer" content="no-referrer">\n`;
+      const shieldInjection = `
+<base href="${parsedUrl.origin}${parsedUrl.pathname}">
+<meta name="referrer" content="no-referrer">
+<script>
+  (function() {
+    try {
+      // 1. Prevent malicious pop-under ad scripts from crashing page
+      window.open = function() { return null; };
+      // 2. Prevent unhandled ad script errors from breaking the video player/DOM
+      window.addEventListener('error', function(e) { e.preventDefault(); e.stopPropagation(); }, true);
+      window.addEventListener('unhandledrejection', function(e) { e.preventDefault(); }, true);
+      // 3. Disable alert/confirm spam
+      window.confirm = function() { return true; };
+    } catch (_) {}
+  })();
+</script>
+`;
       if (/<head[^>]*>/i.test(html)) {
-        html = html.replace(/<head[^>]*>/i, `$&${baseTag}`);
+        html = html.replace(/<head[^>]*>/i, `$&${shieldInjection}`);
       } else {
-        html = baseTag + html;
+        html = shieldInjection + html;
       }
       return res.send(html);
     } else {
