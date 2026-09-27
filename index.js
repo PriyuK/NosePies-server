@@ -1013,13 +1013,19 @@ app.get('/api/proxy', async (req, res) => {
     const setCookie = response.headers.get('set-cookie');
     if (setCookie) {
       res.setHeader('Set-Cookie', setCookie);
+    // Resolve final URL after all HTTP redirects
+    let finalUrl = parsedUrl;
+    if (response.url) {
+      try {
+        finalUrl = new URL(response.url);
+      } catch (_) {}
     }
 
     // If it's HTML, inject <base> tag and anti-crash / ad-shield protection
     if (contentType.includes('text/html')) {
       let html = await response.text();
       const shieldInjection = `
-<base href="${parsedUrl.origin}${parsedUrl.pathname}">
+<base href="${finalUrl.origin}${finalUrl.pathname}">
 <meta name="referrer" content="no-referrer">
 <script>
   (function() {
@@ -1048,6 +1054,22 @@ app.get('/api/proxy', async (req, res) => {
       setInterval(forceVideoControls, 1000);
       document.addEventListener('DOMContentLoaded', forceVideoControls);
       window.addEventListener('load', forceVideoControls);
+
+      // 5. Intercept all link clicks so every navigation stays 100% inside the anonymous proxy relay
+      document.addEventListener('click', function(e) {
+        var el = e.target;
+        while (el && el.tagName !== 'A') {
+          el = el.parentElement;
+        }
+        if (el && el.href && !el.href.startsWith('javascript:') && !el.href.startsWith('#')) {
+          var dest = el.href;
+          if (!dest.includes('/api/proxy?url=')) {
+            e.preventDefault();
+            e.stopPropagation();
+            window.location.href = '/api/proxy?url=' + encodeURIComponent(dest);
+          }
+        }
+      }, true);
     } catch (_) {}
   })();
 </script>
