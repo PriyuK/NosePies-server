@@ -1031,6 +1031,23 @@ app.get('/api/proxy', async (req, res) => {
       window.addEventListener('unhandledrejection', function(e) { e.preventDefault(); }, true);
       // 3. Disable alert/confirm spam
       window.confirm = function() { return true; };
+      // 4. Force HTML5 video controls (Play, Pause, Forward, Seek scrubber)
+      function forceVideoControls() {
+        try {
+          var vids = document.querySelectorAll('video');
+          for (var i = 0; i < vids.length; i++) {
+            var v = vids[i];
+            if (!v.hasAttribute('controls')) {
+              v.setAttribute('controls', 'true');
+              v.controls = true;
+            }
+            v.style.pointerEvents = 'auto';
+          }
+        } catch (_) {}
+      }
+      setInterval(forceVideoControls, 1000);
+      document.addEventListener('DOMContentLoaded', forceVideoControls);
+      window.addEventListener('load', forceVideoControls);
     } catch (_) {}
   })();
 </script>
