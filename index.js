@@ -1636,6 +1636,20 @@ io.on('connection', (socket) => {
       callType: callType || 'audio'
     });
     console.log(`[WebRTC] @${socket.username} calling @${to} (${callType})`);
+
+    // Dispatch high-priority incoming call push notification
+    db.get('SELECT push_token FROM users WHERE LOWER(username) = ?', [cleanTo])
+      .then(recipientUser => {
+        if (recipientUser && recipientUser.push_token) {
+          sendExpoPushNotification(
+            recipientUser.push_token,
+            `@${socket.username}`,
+            callType === 'video' ? '📹 Incoming encrypted video call' : '📞 Incoming encrypted voice call',
+            { sender: socket.username, type: 'call' }
+          );
+        }
+      })
+      .catch(() => {});
   });
 
   socket.on('answer_call', ({ to, answer }) => {
