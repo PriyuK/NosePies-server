@@ -25,6 +25,7 @@ const io = socketIo(server, {
 // Map to keep track of active WebSocket connections
 const onlineUsers = new Map(); // username -> socketId
 const hiddenOnlineUsers = new Set(); // usernames who opted to hide their online status for privacy
+const activeWebRTCCalls = new Map(); // cleanUsername -> { peer: string, callType: 'audio' | 'video' }
 
 // Helper: Dispatch high-priority push notification via Expo Push Notification Service
 async function sendExpoPushNotification(pushToken, title, body, data = {}) {
@@ -1587,11 +1588,119 @@ io.on('connection', (socket) => {
     }
   });
 
+  // --- WebRTC Peer-to-Peer Audio/Video Signaling ---
+  socket.on('call_user', async ({ to, offer, callType }) => {
+    if (!socket.username || !to) return;
+    const cleanTo = to.trim().toLowerCase();
+    const cleanCaller = socket.cleanUsername || socket.username.toLowerCase();
+
+    // Guard: Prevent calling the bot
+    if (cleanTo === bot.BOT_USERNAME.toLowerCase()) {
+      socket.emit('call_rejected', {
+        from: bot.BOT_USERNAME,
+        reason: 'NosePies Bot does not support live voice or video calls.'
+      });
+      return;
+    }
+
+    // Check if recipient is online
+    const userRoom = io.sockets.adapter.rooms.get(`user:${cleanTo}`);
+    const isOnline = (userRoom && userRoom.size > 0) || onlineUsers.has(cleanTo);
+    if (!isOnline) {
+      socket.emit('call_user_offline', { to, reason: 'offline' });
+      return;
+    }
+
+    // Check if recipient is already in a call
+    if (activeWebRTCCalls.has(cleanTo)) {
+      socket.emit('call_busy', { to, reason: 'busy' });
+      return;
+    }
+
+    // Record call attempt
+    activeWebRTCCalls.set(cleanCaller, { peer: cleanTo, callType });
+    activeWebRTCCalls.set(cleanTo, { peer: cleanCaller, callType });
+
+    // Fetch caller avatar if available for incoming call UI
+    let callerAvatar = null;
+    try {
+      const userRec = await db.get('SELECT avatar FROM users WHERE username = ?', [socket.username]);
+      if (userRec && userRec.avatar) callerAvatar = userRec.avatar;
+    } catch (_) {}
+
+    // Relay incoming_call to recipient room
+    io.to(`user:${cleanTo}`).emit('incoming_call', {
+      from: socket.username,
+      callerAvatar,
+      offer,
+      callType: callType || 'audio'
+    });
+    console.log(`[WebRTC] @${socket.username} calling @${to} (${callType})`);
+  });
+
+  socket.on('answer_call', ({ to, answer }) => {
+    if (!socket.username || !to) return;
+    const cleanTo = to.trim().toLowerCase();
+    io.to(`user:${cleanTo}`).emit('call_answered', {
+      from: socket.username,
+      answer
+    });
+    console.log(`[WebRTC] @${socket.username} answered call from @${to}`);
+  });
+
+  socket.on('ice_candidate', ({ to, candidate }) => {
+    if (!socket.username || !to || !candidate) return;
+    const cleanTo = to.trim().toLowerCase();
+    io.to(`user:${cleanTo}`).emit('ice_candidate', {
+      from: socket.username,
+      candidate
+    });
+  });
+
+  socket.on('reject_call', ({ to, reason }) => {
+    if (!socket.username || !to) return;
+    const cleanTo = to.trim().toLowerCase();
+    const cleanCaller = socket.cleanUsername || socket.username.toLowerCase();
+    activeWebRTCCalls.delete(cleanCaller);
+    activeWebRTCCalls.delete(cleanTo);
+
+    io.to(`user:${cleanTo}`).emit('call_rejected', {
+      from: socket.username,
+      reason: reason || 'declined'
+    });
+    console.log(`[WebRTC] Call rejected by @${socket.username} for @${to}`);
+  });
+
+  socket.on('end_call', ({ to }) => {
+    if (!socket.username || !to) return;
+    const cleanTo = to.trim().toLowerCase();
+    const cleanCaller = socket.cleanUsername || socket.username.toLowerCase();
+    activeWebRTCCalls.delete(cleanCaller);
+    activeWebRTCCalls.delete(cleanTo);
+
+    io.to(`user:${cleanTo}`).emit('call_ended', {
+      from: socket.username
+    });
+    console.log(`[WebRTC] Call ended between @${socket.username} and @${to}`);
+  });
+
   socket.on('disconnect', () => {
     if (socket.username) {
       const username = socket.username;
       const lowerUsername = socket.cleanUsername || username.toLowerCase();
       
+      // Clean up any active call if user disconnects
+      const ongoingCall = activeWebRTCCalls.get(lowerUsername);
+      if (ongoingCall) {
+        io.to(`user:${ongoingCall.peer}`).emit('call_ended', {
+          from: username,
+          reason: 'peer_disconnected'
+        });
+        activeWebRTCCalls.delete(lowerUsername);
+        activeWebRTCCalls.delete(ongoingCall.peer);
+        console.log(`[WebRTC] Terminated active call for disconnected user @${username}`);
+      }
+
       const userRoom = io.sockets.adapter.rooms.get(`user:${lowerUsername}`);
       const remainingSockets = userRoom ? userRoom.size : 0;
 
