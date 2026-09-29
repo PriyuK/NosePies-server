@@ -26,6 +26,7 @@ const io = socketIo(server, {
 const onlineUsers = new Map(); // username -> socketId
 const hiddenOnlineUsers = new Set(); // usernames who opted to hide their online status for privacy
 const activeWebRTCCalls = new Map(); // cleanUsername -> { peer: string, callType: 'audio' | 'video' }
+const pendingIncomingCalls = new Map(); // cleanRecipient -> { from: string, callerAvatar: string | null, offer: any, callType: 'audio' | 'video', timestamp: number }
 
 // Helper: Dispatch high-priority push notification via Expo Push Notification Service
 async function sendExpoPushNotification(pushToken, title, body, data = {}) {
@@ -34,13 +35,14 @@ async function sendExpoPushNotification(pushToken, title, body, data = {}) {
     return;
   }
   try {
+    const isCall = data?.type === 'call';
     const payload = {
       to: pushToken,
       sound: 'default',
       title,
       body,
-      channelId: 'messages',
-      priority: 'high',
+      channelId: isCall ? 'calls' : 'messages',
+      priority: isCall ? 'max' : 'high',
       _displayInForeground: true,
       badge: 1,
       data
@@ -1227,6 +1229,18 @@ io.on('connection', (socket) => {
       }
       
       socket.emit('authenticated', { showOnlineStatus: isVisible });
+
+      // If there is an active pending incoming call for this user (< 45s old), deliver it immediately
+      const pendingCall = pendingIncomingCalls.get(lowerUsername);
+      if (pendingCall && (Date.now() - pendingCall.timestamp < 45000)) {
+        socket.emit('incoming_call', {
+          from: pendingCall.from,
+          callerAvatar: pendingCall.callerAvatar,
+          offer: pendingCall.offer,
+          callType: pendingCall.callType
+        });
+        console.log(`[WebRTC] Delivered pending call from @${pendingCall.from} to freshly connected @${username}`);
+      }
     } catch (err) {
       console.error('Socket auth error:', err);
       socket.disconnect();
@@ -1748,24 +1762,42 @@ io.on('connection', (socket) => {
       if (userRec && userRec.avatar) callerAvatar = userRec.avatar;
     } catch (_) {}
 
-    // Relay incoming_call to recipient room
-    io.to(`user:${cleanTo}`).emit('incoming_call', {
+    // Store pending incoming call in map (valid for 45s so offline/reconnecting peer receives it)
+    pendingIncomingCalls.set(cleanTo, {
       from: socket.username,
       callerAvatar,
       offer,
-      callType: callType || 'audio'
+      callType: callType || 'audio',
+      timestamp: Date.now()
     });
-    console.log(`[WebRTC] @${socket.username} calling @${to} (${callType})`);
 
-    // Dispatch high-priority incoming call push notification
+    // Check if recipient is currently connected to active socket room
+    const userRoom = io.sockets.adapter.rooms.get(`user:${cleanTo}`);
+    const isOnline = (userRoom && userRoom.size > 0) || onlineUsers.has(cleanTo);
+
+    if (isOnline) {
+      // Relay incoming_call to recipient room immediately
+      io.to(`user:${cleanTo}`).emit('incoming_call', {
+        from: socket.username,
+        callerAvatar,
+        offer,
+        callType: callType || 'audio'
+      });
+    }
+
+    // Always notify caller that call is ringing and connected to signaling
+    socket.emit('call_ringing', { to });
+    console.log(`[WebRTC] @${socket.username} calling @${to} (${callType}) - recipient ${isOnline ? 'online' : 'offline/background'}`);
+
+    // ALWAYS dispatch high-priority incoming call push notification via Expo Push Notification Service
     db.get('SELECT push_token FROM users WHERE LOWER(username) = ?', [cleanTo])
       .then(recipientUser => {
         if (recipientUser && recipientUser.push_token) {
           sendExpoPushNotification(
             recipientUser.push_token,
-            `@${socket.username}`,
-            callType === 'video' ? '📹 Incoming encrypted video call' : '📞 Incoming encrypted voice call',
-            { sender: socket.username, type: 'call' }
+            `📞 Incoming ${callType === 'video' ? 'Video' : 'Voice'} Call`,
+            `@${socket.username} is calling you...`,
+            { sender: socket.username, type: 'call', callType: callType || 'audio', offer }
           );
         }
       })
@@ -1775,6 +1807,10 @@ io.on('connection', (socket) => {
   socket.on('answer_call', ({ to, answer }) => {
     if (!socket.username || !to) return;
     const cleanTo = to.trim().toLowerCase();
+    const cleanCaller = socket.cleanUsername || socket.username.toLowerCase();
+    pendingIncomingCalls.delete(cleanTo);
+    pendingIncomingCalls.delete(cleanCaller);
+
     io.to(`user:${cleanTo}`).emit('call_answered', {
       from: socket.username,
       answer
@@ -1797,6 +1833,8 @@ io.on('connection', (socket) => {
     const cleanCaller = socket.cleanUsername || socket.username.toLowerCase();
     activeWebRTCCalls.delete(cleanCaller);
     activeWebRTCCalls.delete(cleanTo);
+    pendingIncomingCalls.delete(cleanTo);
+    pendingIncomingCalls.delete(cleanCaller);
 
     io.to(`user:${cleanTo}`).emit('call_rejected', {
       from: socket.username,
@@ -1811,6 +1849,8 @@ io.on('connection', (socket) => {
     const cleanCaller = socket.cleanUsername || socket.username.toLowerCase();
     activeWebRTCCalls.delete(cleanCaller);
     activeWebRTCCalls.delete(cleanTo);
+    pendingIncomingCalls.delete(cleanTo);
+    pendingIncomingCalls.delete(cleanCaller);
 
     io.to(`user:${cleanTo}`).emit('call_ended', {
       from: socket.username
