@@ -26,7 +26,18 @@ const io = socketIo(server, {
 const onlineUsers = new Map(); // username -> socketId
 const hiddenOnlineUsers = new Set(); // usernames who opted to hide their online status for privacy
 const activeWebRTCCalls = new Map(); // cleanUsername -> { peer: string, callType: 'audio' | 'video' }
-const pendingIncomingCalls = new Map(); // cleanRecipient -> { from: string, callerAvatar: string | null, offer: any, callType: 'audio' | 'video', timestamp: number }
+const pendingIncomingCalls = new Map(); // cleanRecipient -> { from: string, callerAvatar: string | null, offer: any, callType: 'audio' | 'video', timestamp: number, expiryTimer: any }
+
+// Helper: Safely cancel timeout and remove pending incoming call
+function clearPendingIncomingCall(recipient) {
+  if (!recipient) return;
+  const cleanRecipient = recipient.trim().toLowerCase();
+  const pending = pendingIncomingCalls.get(cleanRecipient);
+  if (pending) {
+    if (pending.expiryTimer) clearTimeout(pending.expiryTimer);
+    pendingIncomingCalls.delete(cleanRecipient);
+  }
+}
 
 // Helper: Dispatch high-priority push notification via Expo Push Notification Service
 async function sendExpoPushNotification(pushToken, title, body, data = {}) {
@@ -1724,9 +1735,16 @@ io.on('connection', (socket) => {
 
   // --- WebRTC Peer-to-Peer Audio/Video Signaling ---
   socket.on('call_user', async ({ to, offer, callType }) => {
-    if (!socket.username || !to) return;
+    // Problem 7 fix: Validate parameters including offer
+    if (!socket.username || !to || !offer) return;
     const cleanTo = to.trim().toLowerCase();
     const cleanCaller = socket.cleanUsername || socket.username.toLowerCase();
+
+    // Problem 3 fix: Prevent calling oneself
+    if (cleanTo === cleanCaller) {
+      socket.emit('call_error', { message: 'You cannot call yourself.' });
+      return;
+    }
 
     // Guard: Prevent calling the bot
     if (cleanTo === bot.BOT_USERNAME.toLowerCase()) {
@@ -1737,23 +1755,25 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // Check if recipient is online
-    const userRoom = io.sockets.adapter.rooms.get(`user:${cleanTo}`);
-    const isOnline = (userRoom && userRoom.size > 0) || onlineUsers.has(cleanTo);
-    if (!isOnline) {
-      socket.emit('call_user_offline', { to, reason: 'offline' });
+    // Problem 4 fix: Check if caller is already in another active call
+    if (activeWebRTCCalls.has(cleanCaller)) {
+      socket.emit('call_busy', { to, reason: 'caller_already_in_call' });
       return;
     }
 
-    // Check if recipient is already in a call
+    // Check if recipient is already in another call
     if (activeWebRTCCalls.has(cleanTo)) {
       socket.emit('call_busy', { to, reason: 'busy' });
       return;
     }
 
-    // Record call attempt
-    activeWebRTCCalls.set(cleanCaller, { peer: cleanTo, callType });
-    activeWebRTCCalls.set(cleanTo, { peer: cleanCaller, callType });
+    // Clear any previous stale pending call before registering new call
+    clearPendingIncomingCall(cleanTo);
+    clearPendingIncomingCall(cleanCaller);
+
+    // Record call session
+    activeWebRTCCalls.set(cleanCaller, { peer: cleanTo, callType: callType || 'audio' });
+    activeWebRTCCalls.set(cleanTo, { peer: cleanCaller, callType: callType || 'audio' });
 
     // Fetch caller avatar if available for incoming call UI
     let callerAvatar = null;
@@ -1762,16 +1782,30 @@ io.on('connection', (socket) => {
       if (userRec && userRec.avatar) callerAvatar = userRec.avatar;
     } catch (_) {}
 
+    // Problem 5 fix: Auto-expiry timer for pending incoming calls to prevent memory leaks and hanging calls
+    const callTimestamp = Date.now();
+    const expiryTimer = setTimeout(() => {
+      const current = pendingIncomingCalls.get(cleanTo);
+      if (current && current.timestamp === callTimestamp) {
+        pendingIncomingCalls.delete(cleanTo);
+        activeWebRTCCalls.delete(cleanCaller);
+        activeWebRTCCalls.delete(cleanTo);
+        io.to(`user:${cleanTo}`).emit('call_ended', { from: socket.username, reason: 'timeout' });
+        socket.emit('call_ended', { from: to, reason: 'timeout' });
+      }
+    }, 45000);
+
     // Store pending incoming call in map (valid for 45s so offline/reconnecting peer receives it)
     pendingIncomingCalls.set(cleanTo, {
       from: socket.username,
       callerAvatar,
       offer,
       callType: callType || 'audio',
-      timestamp: Date.now()
+      timestamp: callTimestamp,
+      expiryTimer
     });
 
-    // Check if recipient is currently connected to active socket room
+    // Problem 1 & 2 fix: Single scoped online check; no duplicate declarations and no early offline abort
     const userRoom = io.sockets.adapter.rooms.get(`user:${cleanTo}`);
     const isOnline = (userRoom && userRoom.size > 0) || onlineUsers.has(cleanTo);
 
@@ -1805,11 +1839,12 @@ io.on('connection', (socket) => {
   });
 
   socket.on('answer_call', ({ to, answer }) => {
-    if (!socket.username || !to) return;
+    // Problem 7 fix: Validate answer payload
+    if (!socket.username || !to || !answer) return;
     const cleanTo = to.trim().toLowerCase();
     const cleanCaller = socket.cleanUsername || socket.username.toLowerCase();
-    pendingIncomingCalls.delete(cleanTo);
-    pendingIncomingCalls.delete(cleanCaller);
+    clearPendingIncomingCall(cleanTo);
+    clearPendingIncomingCall(cleanCaller);
 
     io.to(`user:${cleanTo}`).emit('call_answered', {
       from: socket.username,
@@ -1821,6 +1856,14 @@ io.on('connection', (socket) => {
   socket.on('ice_candidate', ({ to, candidate }) => {
     if (!socket.username || !to || !candidate) return;
     const cleanTo = to.trim().toLowerCase();
+    const cleanCaller = socket.cleanUsername || socket.username.toLowerCase();
+
+    // Problem 7 fix: Verify active call pairing before relaying ICE candidate
+    const activeCall = activeWebRTCCalls.get(cleanCaller);
+    if (!activeCall || activeCall.peer !== cleanTo) {
+      return;
+    }
+
     io.to(`user:${cleanTo}`).emit('ice_candidate', {
       from: socket.username,
       candidate
@@ -1833,8 +1876,8 @@ io.on('connection', (socket) => {
     const cleanCaller = socket.cleanUsername || socket.username.toLowerCase();
     activeWebRTCCalls.delete(cleanCaller);
     activeWebRTCCalls.delete(cleanTo);
-    pendingIncomingCalls.delete(cleanTo);
-    pendingIncomingCalls.delete(cleanCaller);
+    clearPendingIncomingCall(cleanTo);
+    clearPendingIncomingCall(cleanCaller);
 
     io.to(`user:${cleanTo}`).emit('call_rejected', {
       from: socket.username,
@@ -1849,8 +1892,8 @@ io.on('connection', (socket) => {
     const cleanCaller = socket.cleanUsername || socket.username.toLowerCase();
     activeWebRTCCalls.delete(cleanCaller);
     activeWebRTCCalls.delete(cleanTo);
-    pendingIncomingCalls.delete(cleanTo);
-    pendingIncomingCalls.delete(cleanCaller);
+    clearPendingIncomingCall(cleanTo);
+    clearPendingIncomingCall(cleanCaller);
 
     io.to(`user:${cleanTo}`).emit('call_ended', {
       from: socket.username
@@ -1873,6 +1916,19 @@ io.on('connection', (socket) => {
         activeWebRTCCalls.delete(lowerUsername);
         activeWebRTCCalls.delete(ongoingCall.peer);
         console.log(`[WebRTC] Terminated active call for disconnected user @${username}`);
+      }
+
+      // Problem 6 fix: Clean up any pending incoming calls where this user is caller or recipient
+      clearPendingIncomingCall(lowerUsername);
+      for (const [recipient, pendingCall] of pendingIncomingCalls.entries()) {
+        if (pendingCall.from.toLowerCase() === lowerUsername) {
+          clearPendingIncomingCall(recipient);
+          activeWebRTCCalls.delete(recipient);
+          io.to(`user:${recipient}`).emit('call_ended', {
+            from: username,
+            reason: 'caller_disconnected'
+          });
+        }
       }
 
       const userRoom = io.sockets.adapter.rooms.get(`user:${lowerUsername}`);
