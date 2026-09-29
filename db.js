@@ -119,7 +119,21 @@ const schemaQueries = [
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`,
   `CREATE INDEX IF NOT EXISTS idx_user_reports_status ON user_reports(status)`,
-  `CREATE INDEX IF NOT EXISTS idx_user_reports_reported ON user_reports(reported_user)`
+  `CREATE INDEX IF NOT EXISTS idx_user_reports_reported ON user_reports(reported_user)`,
+
+  `CREATE TABLE IF NOT EXISTS shared_locker (
+    id TEXT PRIMARY KEY,
+    conversation_pair TEXT NOT NULL,
+    author TEXT NOT NULL,
+    category TEXT NOT NULL,
+    title TEXT NOT NULL,
+    encrypted_secret TEXT NOT NULL,
+    nonce TEXT NOT NULL,
+    note TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_shared_locker_pair ON shared_locker(conversation_pair)`
 ];
 
 if (isTurso) {

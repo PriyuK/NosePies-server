@@ -462,6 +462,34 @@ app.post('/api/messages/sync', async (req, res) => {
   }
 });
 
+// Concept 5: In-Chat Encrypted Locker Sync endpoint
+app.post('/api/locker/sync', async (req, res) => {
+  const { username, authKeyHash, peer } = req.body;
+  if (!username || !authKeyHash || !peer) {
+    return res.status(400).json({ error: 'Missing required sync parameters' });
+  }
+
+  const cleanUsername = username.trim().toLowerCase();
+  const cleanPeer = peer.trim().toLowerCase();
+  try {
+    const user = await db.get('SELECT auth_key_hash FROM users WHERE LOWER(username) = ?', [cleanUsername]);
+    if (!user || user.auth_key_hash !== authKeyHash) {
+      return res.status(401).json({ error: 'Authentication failed' });
+    }
+
+    const pair = [cleanUsername, cleanPeer].sort().join(':');
+    const items = await db.all(
+      'SELECT id, author, category, title, encrypted_secret, nonce, note, created_at, updated_at FROM shared_locker WHERE conversation_pair = ? ORDER BY updated_at DESC',
+      [pair]
+    );
+
+    res.json({ items });
+  } catch (err) {
+    console.error('Locker sync error:', err);
+    res.status(500).json({ error: 'Database error fetching locker items' });
+  }
+});
+
 // --- Recovery Routes (Emergency Phrase & Trusted Social Recovery) ---
 
 // Setup or update emergency recovery phrase blob
@@ -1462,6 +1490,61 @@ io.on('connection', (socket) => {
       });
       console.log(`[Ghost Recall] Message ${messageId} ghost-recalled by @${socket.username}`);
     }
+  });
+
+  // Concept 5: In-Chat Encrypted Locker Socket Events
+  socket.on('save_locker_item', async ({ recipient, item }) => {
+    if (!socket.username || !recipient || !item || !item.id) return;
+    const cleanUser = socket.username.trim().toLowerCase();
+    const cleanPeer = recipient.trim().toLowerCase();
+    const pair = [cleanUser, cleanPeer].sort().join(':');
+
+    try {
+      await db.run(
+        `INSERT OR REPLACE INTO shared_locker (id, conversation_pair, author, category, title, encrypted_secret, nonce, note, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT created_at FROM shared_locker WHERE id = ?), CURRENT_TIMESTAMP), CURRENT_TIMESTAMP)`,
+        [
+          item.id,
+          pair,
+          cleanUser,
+          item.category || 'note',
+          item.title,
+          item.encrypted_secret,
+          item.nonce,
+          item.note || '',
+          item.id
+        ]
+      );
+    } catch (err) {
+      console.error('Error saving shared_locker item:', err);
+    }
+
+    const payload = {
+      ...item,
+      author: cleanUser,
+      conversation_pair: pair,
+      updated_at: new Date().toISOString()
+    };
+    io.to(`user:${cleanPeer}`).emit('locker_item_updated', { peer: cleanUser, item: payload });
+    io.to(`user:${cleanUser}`).emit('locker_item_updated', { peer: cleanPeer, item: payload });
+    console.log(`[Locker] Item ${item.id} saved in locker for pair ${pair}`);
+  });
+
+  socket.on('delete_locker_item', async ({ recipient, itemId }) => {
+    if (!socket.username || !recipient || !itemId) return;
+    const cleanUser = socket.username.trim().toLowerCase();
+    const cleanPeer = recipient.trim().toLowerCase();
+    const pair = [cleanUser, cleanPeer].sort().join(':');
+
+    try {
+      await db.run('DELETE FROM shared_locker WHERE id = ? AND conversation_pair = ?', [itemId, pair]);
+    } catch (err) {
+      console.error('Error deleting shared_locker item:', err);
+    }
+
+    io.to(`user:${cleanPeer}`).emit('locker_item_deleted', { peer: cleanUser, itemId });
+    io.to(`user:${cleanUser}`).emit('locker_item_deleted', { peer: cleanPeer, itemId });
+    console.log(`[Locker] Item ${itemId} deleted from locker for pair ${pair}`);
   });
 
   // Client confirms message received/delivered
