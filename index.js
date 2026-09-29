@@ -1427,6 +1427,23 @@ io.on('connection', (socket) => {
     } catch (_) {}
   });
 
+  // Client informs that a message was burned on read (Strict Anti-Leak)
+  socket.on('message_burned', async ({ messageId, peer }) => {
+    if (!socket.username || !messageId) return;
+    try {
+      // Purge permanently from database vault
+      await db.run('DELETE FROM vault_messages WHERE id = ?', [messageId]);
+    } catch (_) {}
+    if (peer) {
+      const cleanPeer = peer.trim().toLowerCase();
+      io.to(`user:${cleanPeer}`).emit('message_burned', {
+        messageId,
+        burner: socket.username
+      });
+      console.log(`[Anti-Leak] Message ${messageId} burned by @${socket.username}`);
+    }
+  });
+
   // Client confirms message received/delivered
   socket.on('message_delivered', async ({ messageId, sender }) => {
     if (!sender) return;
