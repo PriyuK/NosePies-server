@@ -1444,6 +1444,26 @@ io.on('connection', (socket) => {
     }
   });
 
+  // Client requests Ghost Recall (Anti-Regret / Smart Delay):
+  // Permanently delete message from vault and notify peer to wipe without placeholder
+  socket.on('ghost_recall_message', async ({ messageId, peer }) => {
+    if (!socket.username || !messageId) return;
+    try {
+      await db.run(
+        'DELETE FROM vault_messages WHERE id = ? AND LOWER(sender) = ?',
+        [messageId, socket.username.toLowerCase()]
+      );
+    } catch (_) {}
+    if (peer) {
+      const cleanPeer = peer.trim().toLowerCase();
+      io.to(`user:${cleanPeer}`).emit('ghost_recall_message', {
+        messageId,
+        sender: socket.username
+      });
+      console.log(`[Ghost Recall] Message ${messageId} ghost-recalled by @${socket.username}`);
+    }
+  });
+
   // Client confirms message received/delivered
   socket.on('message_delivered', async ({ messageId, sender }) => {
     if (!sender) return;
